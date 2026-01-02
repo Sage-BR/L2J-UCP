@@ -47,32 +47,93 @@ if (isset($_POST['buy_id'])) {
     if ($itemQuery->num_rows > 0 && !empty($charId)) {
         $item = $itemQuery->fetch_assoc();
         
-        // Verifica Limite
-        $boughtCount = 0;
-        if ($item['limit_count'] > 0) {
-            $hist = $conn->query("SELECT COUNT(*) as total FROM site_shop_history WHERE login='$user' AND item_db_id=$buyDbId");
-            $boughtCount = $hist->fetch_assoc()['total'];
-        }
+        // Verifica se personagem está online
+        $charCheck = $conn->query("SELECT online, char_name FROM characters WHERE charId=$charId AND account_name='$user'");
+        if ($charCheck->num_rows == 0) {
+            $msg = "Personagem não encontrado ou não pertence a você."; 
+            $msgType = "error";
+        } else {
+            $charData = $charCheck->fetch_assoc();
+            
+            if ($charData['online'] == 1) {
+                $msg = "O personagem {$charData['char_name']} está online! Deslogue para comprar."; 
+                $msgType = "error";
+            } else {
+                // Verifica Limite
+                $boughtCount = 0;
+                if ($item['limit_count'] > 0) {
+                    $hist = $conn->query("SELECT COUNT(*) as total FROM site_shop_history WHERE login='$user' AND item_db_id=$buyDbId");
+                    $boughtCount = $hist->fetch_assoc()['total'];
+                }
 
-        if ($item['stock'] == 0) { $msg = "Esgotado!"; $msgType = "error"; }
-        else if ($item['limit_count'] > 0 && $boughtCount >= $item['limit_count']) { $msg = "Limite atingido!"; $msgType = "error"; }
-        else {
-            $accRow = $conn->query("SELECT coins FROM accounts WHERE login='$user'")->fetch_assoc();
-            if ($accRow['coins'] >= $item['price']) {
-                $conn->query("UPDATE accounts SET coins = coins - {$item['price']} WHERE login='$user'");
-                if ($item['stock'] > 0) $conn->query("UPDATE site_shop_items SET stock = stock - 1 WHERE id=$buyDbId");
-                
-                $conn->query("INSERT INTO site_shop_history (login, item_db_id, count) VALUES ('$user', $buyDbId, 1)"); // Histórico
-                
-                $stmt = $conn->prepare("INSERT INTO items_delayed (owner_id, item_id, count, payment_status, description) VALUES (?, ?, ?, 0, ?)");
-                $desc = "Shop: " . $item['name'];
-                $stmt->bind_param("iiis", $charId, $item['item_id'], $item['count'], $desc);
-                $stmt->execute();
-                
-                $msg = "Compra realizada!"; $msgType = "success";
-            } else { $msg = "Saldo insuficiente."; $msgType = "error"; }
+                if ($item['stock'] == 0) { 
+                    $msg = "Esgotado!"; 
+                    $msgType = "error"; 
+                }
+                else if ($item['limit_count'] > 0 && $boughtCount >= $item['limit_count']) { 
+                    $msg = "Limite atingido!"; 
+                    $msgType = "error"; 
+                }
+                else {
+                    $accRow = $conn->query("SELECT coins FROM accounts WHERE login='$user'")->fetch_assoc();
+                    if ($accRow['coins'] >= $item['price']) {
+                        // Inicia transação para garantir atomicidade
+                        $conn->begin_transaction();
+                        
+                        try {
+                            // Gera um novo object_id único
+                            $maxObjId = $conn->query("SELECT MAX(object_id) as max_id FROM items FOR UPDATE");
+                            $maxObjIdRow = $maxObjId->fetch_assoc();
+                            $newObjectId = ($maxObjIdRow['max_id'] ?? 100000) + 1;
+                            
+                            // Insere item direto no inventário
+                            $stmt = $conn->prepare("INSERT INTO items (owner_id, object_id, item_id, count, enchant_level, loc, loc_data, custom_type1, custom_type2) VALUES (?, ?, ?, ?, 0, 'INVENTORY', 0, 0, 0)");
+                            $stmt->bind_param("iiii", $charId, $newObjectId, $item['item_id'], $item['count']);
+                            
+                            if (!$stmt->execute()) {
+                                throw new Exception("Falha ao inserir item");
+                            }
+                            
+                            // Deduz as moedas
+                            $updateCoins = $conn->query("UPDATE accounts SET coins = coins - {$item['price']} WHERE login='$user' AND coins >= {$item['price']}");
+                            if ($conn->affected_rows == 0) {
+                                throw new Exception("Saldo insuficiente ou conta não encontrada");
+                            }
+                            
+                            // Atualiza estoque
+                            if ($item['stock'] > 0) {
+                                $updateStock = $conn->query("UPDATE site_shop_items SET stock = stock - 1 WHERE id=$buyDbId AND stock > 0");
+                                if ($conn->affected_rows == 0) {
+                                    throw new Exception("Item esgotado");
+                                }
+                            }
+                            
+                            // Registra no histórico
+                            $conn->query("INSERT INTO site_shop_history (login, item_db_id, count) VALUES ('$user', $buyDbId, 1)");
+                            
+                            // Confirma transação
+                            $conn->commit();
+                            
+                            $msg = "Compra realizada! Item adicionado ao inventário de {$charData['char_name']}."; 
+                            $msgType = "success";
+                            
+                        } catch (Exception $e) {
+                            // Reverte todas as alterações em caso de erro
+                            $conn->rollback();
+                            $msg = "Erro na compra: " . $e->getMessage(); 
+                            $msgType = "error";
+                        }
+                    } else { 
+                        $msg = "Saldo insuficiente."; 
+                        $msgType = "error"; 
+                    }
+                }
+            }
         }
-    } else { $msg = "Selecione um personagem."; $msgType = "error"; }
+    } else { 
+        $msg = "Selecione um personagem."; 
+        $msgType = "error"; 
+    }
 }
 
 $chars = [];
